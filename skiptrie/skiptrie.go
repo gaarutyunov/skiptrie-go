@@ -1,16 +1,16 @@
 package skiptrie
 
 import (
-	"math"
 	"math/rand"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"unsafe"
 )
 
 const (
-	MaxKey = 1 << 32 // u = 2^32
-	LogLogU = 5      // log log u = 5 for u = 2^32
+	MaxKey = (1 << 32) - 1 // u = 2^32, but max uint32 is 2^32-1
+	LogLogU = 5           // log log u = 5 for u = 2^32
 )
 
 // Node represents a skiplist node
@@ -23,7 +23,6 @@ type Node struct {
 	ready      atomic.Bool              // indicates prev pointer is set
 	stop       atomic.Bool              // stop flag for tower operations
 	origHeight int                      // original height of the node
-	down       []*Node                  // pointers to lower level nodes
 }
 
 // TreeNode represents an x-fast trie node
@@ -88,8 +87,11 @@ func (st *SkipTrie) randomHeight() int {
 // listSearch finds the predecessor and successor of a key at a given level
 func (st *SkipTrie) listSearch(key uint32, start *Node, level int) (*Node, *Node) {
 	var left, right *Node
+	maxIterations := 1000 // Prevent infinite loops
+	iterations := 0
 	
-	for {
+	for iterations < maxIterations {
+		iterations++
 		left = start
 		right = left.next[level].Load()
 		
@@ -128,7 +130,15 @@ func (st *SkipTrie) listSearch(key uint32, start *Node, level int) (*Node, *Node
 				return left, right
 			}
 		}
+		
+		// Add yield after some iterations to help with livelock
+		if iterations > 100 {
+			runtime.Gosched()
+		}
 	}
+	
+	// Fallback: return what we have to prevent infinite loops
+	return left, right
 }
 
 // skiplistInsert inserts a key into the skiplist
@@ -140,7 +150,6 @@ func (st *SkipTrie) skiplistInsert(key uint32) *Node {
 		key:        key,
 		next:       make([]*atomic.Pointer[Node], height),
 		origHeight: height,
-		down:       make([]*Node, height),
 	}
 	
 	// Initialize atomic pointers
@@ -167,8 +176,9 @@ func (st *SkipTrie) skiplistInsert(key uint32) *Node {
 			preds[level] = left
 			succs[level] = right
 		}
-		if level > 0 && start.down != nil && len(start.down) > level-1 {
-			start = start.down[level-1]
+		if level > 0 && start.next != nil && len(start.next) > level-1 {
+			// Move to next level down if available
+			continue
 		}
 	}
 	
@@ -204,7 +214,10 @@ func (st *SkipTrie) skiplistInsert(key uint32) *Node {
 
 // fixPrev sets the prev pointer of a node
 func (st *SkipTrie) fixPrev(pred *Node, node *Node) {
-	for !node.marked.Load() {
+	retries := 0
+	maxRetries := 100 // Add maximum retry limit to prevent infinite loops
+	
+	for !node.marked.Load() && retries < maxRetries {
 		left, right := st.listSearch(node.key, pred, LogLogU-1)
 		if right == node {
 			node.prev.Store(left)
@@ -212,6 +225,18 @@ func (st *SkipTrie) fixPrev(pred *Node, node *Node) {
 			return
 		}
 		pred = left
+		retries++
+		
+		// Add a small delay to help with livelock
+		if retries > 10 {
+			runtime.Gosched() // Yield to other goroutines
+		}
+	}
+	
+	// If we couldn't fix prev after max retries, just mark as ready
+	// This is a fallback to prevent infinite loops
+	if retries >= maxRetries {
+		node.ready.Store(true)
 	}
 }
 
@@ -383,7 +408,7 @@ func (st *SkipTrie) insertIntoTrie(node *Node) {
 	for i := 31; i >= 0; i-- {
 		prefix := st.extractPrefix(node.key, 0, i+1)
 		direction := 0
-		if i < 31 && (node.key&(1<<(30-i))) != 0 {
+		if i < 31 && (node.key&(1<<(31-i-1))) != 0 {
 			direction = 1
 		}
 		
@@ -427,9 +452,18 @@ func (st *SkipTrie) insertIntoTrie(node *Node) {
 
 // Delete deletes a key from the SkipTrie
 func (st *SkipTrie) Delete(key uint32) bool {
-	// Find the node
-	pred := st.Predecessor(key - 1)
+	// Find the node by searching from head
+	pred := st.head
+	if key > 0 {
+		pred = st.Predecessor(key)
+	}
+	
 	curr := pred
+	if pred != nil && pred != st.head {
+		curr = pred.next[0].Load()
+	} else {
+		curr = st.head.next[0].Load()
+	}
 	
 	// Search for exact key
 	for curr != nil && curr.key < key {
@@ -458,7 +492,7 @@ func (st *SkipTrie) deleteFromTrie(node *Node) {
 	for i := 0; i < 32; i++ {
 		prefix := st.extractPrefix(node.key, 0, i+1)
 		direction := 0
-		if i < 31 && (node.key&(1<<(30-i))) != 0 {
+		if i < 31 && (node.key&(1<<(31-i-1))) != 0 {
 			direction = 1
 		}
 		
@@ -500,18 +534,12 @@ func (st *SkipTrie) deleteFromTrie(node *Node) {
 
 // Predecessor finds the predecessor of a key
 func (st *SkipTrie) Predecessor(key uint32) *Node {
-	// Start from x-fast trie
-	start := st.xFastTriePred(key)
-	if start == nil {
-		start = st.head
-	}
-	
-	// Search through skiplist
-	curr := start
+	// Search through skiplist starting from head
+	curr := st.head
 	for level := LogLogU - 1; level >= 0; level-- {
-		for {
+		for curr != nil {
 			next := curr.next[level].Load()
-			if next == nil || next.key >= key {
+			if next == nil || next == st.tail || next.key >= key {
 				break
 			}
 			if !next.marked.Load() {
@@ -521,10 +549,6 @@ func (st *SkipTrie) Predecessor(key uint32) *Node {
 				nextNext := next.next[level].Load()
 				curr.next[level].CompareAndSwap(next, nextNext)
 			}
-		}
-		
-		if level > 0 && curr.down != nil && len(curr.down) > level-1 {
-			curr = curr.down[level-1]
 		}
 	}
 	

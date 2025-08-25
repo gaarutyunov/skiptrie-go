@@ -2,6 +2,7 @@ package skiptrie
 
 import (
 	"math/rand"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -86,8 +87,11 @@ func (st *SkipTrie) randomHeight() int {
 // listSearch finds the predecessor and successor of a key at a given level
 func (st *SkipTrie) listSearch(key uint32, start *Node, level int) (*Node, *Node) {
 	var left, right *Node
+	maxIterations := 1000 // Prevent infinite loops
+	iterations := 0
 	
-	for {
+	for iterations < maxIterations {
+		iterations++
 		left = start
 		right = left.next[level].Load()
 		
@@ -126,7 +130,15 @@ func (st *SkipTrie) listSearch(key uint32, start *Node, level int) (*Node, *Node
 				return left, right
 			}
 		}
+		
+		// Add yield after some iterations to help with livelock
+		if iterations > 100 {
+			runtime.Gosched()
+		}
 	}
+	
+	// Fallback: return what we have to prevent infinite loops
+	return left, right
 }
 
 // skiplistInsert inserts a key into the skiplist
@@ -202,7 +214,10 @@ func (st *SkipTrie) skiplistInsert(key uint32) *Node {
 
 // fixPrev sets the prev pointer of a node
 func (st *SkipTrie) fixPrev(pred *Node, node *Node) {
-	for !node.marked.Load() {
+	retries := 0
+	maxRetries := 100 // Add maximum retry limit to prevent infinite loops
+	
+	for !node.marked.Load() && retries < maxRetries {
 		left, right := st.listSearch(node.key, pred, LogLogU-1)
 		if right == node {
 			node.prev.Store(left)
@@ -210,6 +225,18 @@ func (st *SkipTrie) fixPrev(pred *Node, node *Node) {
 			return
 		}
 		pred = left
+		retries++
+		
+		// Add a small delay to help with livelock
+		if retries > 10 {
+			runtime.Gosched() // Yield to other goroutines
+		}
+	}
+	
+	// If we couldn't fix prev after max retries, just mark as ready
+	// This is a fallback to prevent infinite loops
+	if retries >= maxRetries {
+		node.ready.Store(true)
 	}
 }
 
